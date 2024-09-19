@@ -1,0 +1,459 @@
+---
+title: "Análisis de datos Lattice para NINIs en comunas de Medellín"
+author: "Julián Castaño Pineda"
+date: "2024-09-11"
+output: 
+  html_document: 
+    theme: united
+    highlight: tango
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE,message=FALSE}
+library(tidyverse)
+library(readxl)
+library(geoR)
+library(leaflet)
+library(magrittr)
+library(sm)
+library(sf)
+library(sp)
+library(spatstat)
+library(tmap)
+library(tmaptools)
+library(spatstat)
+library(spdep)
+library(gstat)
+library(spatialreg)
+library(DT)
+library(ggplot2)
+```
+
+# Pregunta de investigación
+
+¿Existe una estructura espacial entre las comunas de Medellín en relación con el porcentaje de jóvenes afectados por la problemática de la Ninidad?
+
+# Metodología
+
+-   Se usará la encuesta de calidad de vida de 2022 obtenida de <https://www.medellin.gov.co/es/centro-documental/encuesta-de-calidad-de-vida-2022/>
+
+-   Con base en la segmentación de grupos etarios del Departamento Nacional de Estadística (DANE) se tomará solo la población entre 14-28 años
+
+-   Se tomarán solo las siguientes variables:
+
+    -   **Variable:** p_006 - **Posición:** 8 - **Etiqueta:** Comunas de Medellín
+    -   **Variable:** p_015 - **Posición:** 12 - **Etiqueta:** Sexo
+    -   **Variable:** p_018 - **Posición:** 14 - **Etiqueta:** Edad
+    -   **Variable:** p_036 - **Posición:** 34 - **Etiqueta:** Actualmente estudia? (asiste a sala cuna, guardería, preescolar, escuela, colegio, técnico, tecnológico o universidad)
+    -   **Variable:** p_037 - **Posición:** 35 - **Etiqueta:**Estudió durante este año?
+    -   **Variable:** p_069 - **Posición:** 35 - **Etiqueta:**¿En qué actividad ocupó la mayor parte del tiempo la semana pasada?
+    -   **Variable:** p_076 - **Posición:** 67 - **Etiqueta:** ¿Durante los últimos 12 meses, trabajó por lo menos 2 semanas consecutivas?
+
+Se usaran estos datos para evaluar la estructura espacial del proceso.
+
+Adicionalmente se agregaron 3 variables adicionales para ver si tienen relación con la problemática Nini
+
+-   **Variable:** p_058 - **Posición:** 54 - **Etiqueta:** ¿Cuántos hijos nacidos vivos ha tenido, en toda su vida?
+-   **Variable:** p_254 - **Posición:** 226 - **Etiqueta:** Los ingresos anuales ascienden a
+-   **Variable:** 271 - **Posición:** 243 - **Etiqueta:** ¿Usted considera que existe discriminación contra la mujer?
+
+# Datos {.tabset}
+
+## Datos crudos
+
+```{r, warning=FALSE}
+nini_df <- read_excel("Encuesta Calidad de Vida_ECV2022.xlsx")[,c(4,8,10,30,31,62,63,50,222,239)] 
+
+nini_df_clean<-nini_df %>%  
+  mutate(p_037 = ifelse(p_037==-88,p_036,p_037)) %>% 
+  mutate(p_076 = ifelse(p_076==-88,p_069,p_076)) %>% 
+  rename(NOMBRE = p_006, Sexo = p_015, Edad = p_018, Estudia = p_036,
+         EstudiaAño = p_037, Ocupacion = p_069, TrabajaAño = p_076,
+         Hijos = p_058, Ingresos = p_254, Discriminacion = p_271 ) %>% 
+  filter(Edad<=28,Edad>=14) %>% 
+  mutate(TrabajaAño = ifelse(TrabajaAño %in% c(-99,-98,8,999),NA,TrabajaAño)) %>%
+  mutate(Hijos = ifelse(Hijos %in% c(-99,-88),NA, Hijos)) %>% 
+  mutate(Discriminacion = ifelse(Discriminacion==1,1,ifelse(Discriminacion==2,0,NA))) %>% 
+  mutate(Ocupacion = ifelse(Ocupacion %in% c(-99),NA,Ocupacion))%>% 
+   mutate(NOMBRE = recode(NOMBRE, 
+                         `1` = "Popular",
+                         `2` = "Santa Cruz",
+                         `3` = "Manrique",
+                         `4` = "Aranjuez",
+                         `5` = "Castilla",
+                         `6` = "Doce de Octubre",
+                         `7` = "Robledo",
+                         `8` = "Villa Hermosa",
+                         `9` = "Buenos Aires",
+                         `10` = "La Candelaria",
+                         `11` = "Laureles Estadio",
+                         `12` = "La América",
+                         `13` = "San Javier",
+                         `14` = "El Poblado",
+                         `15` = "Guayabal",
+                         `16` = "Belén",
+                         `50` = "Corregimiento de San Sebastián de Palmitas",
+                         `60` = "Corregimiento de San Cristóbal",
+                         `70` = "Corregimiento de Altavista",
+                         `80` = "Corregimiento de San Antonio de Prado",
+                         `90` = "Corregimiento de Santa Elena")) %>% 
+  mutate(Sexo = ifelse(Sexo == 2, "Mujer", "Hombre"),
+         NiniCortoPlazo  = ifelse(Estudia == 2 & Ocupacion != 1,1,0), # NINI YA
+         NiniLargoPlazo = ifelse(EstudiaAño == 2 & TrabajaAño == 2,1,0)) # NINI durante un año
+
+datatable(nini_df_clean)
+  
+```
+
+## Summarize
+
+```{r, warning=FALSE}
+nini_comunas <- nini_df_clean %>% group_by(NOMBRE) %>%
+  summarise(NiniLargoPlazo = mean(NiniLargoPlazo, na.rm = T)*100,
+            NiniCortoPlazo = mean(NiniCortoPlazo, na.rm = T)*100) 
+
+nini_comunas_hombres <- nini_df_clean %>% filter(Sexo == "Hombre") %>% group_by(NOMBRE) %>%
+  summarise(NiniLargoPlazoH = mean(NiniLargoPlazo, na.rm = T)*100,
+            NiniCortoPlazoH = mean(NiniCortoPlazo, na.rm = T)*100) 
+
+nini_comunas_mujeres <- nini_df_clean %>% filter(Sexo == "Mujer") %>% group_by(NOMBRE) %>%
+  summarise(NiniLargoPlazoM = mean(NiniLargoPlazo, na.rm = T)*100,
+            NiniCortoPlazoM = mean(NiniCortoPlazo, na.rm = T)*100) 
+
+nini_comunas_variables <- nini_df_clean %>% group_by(NOMBRE) %>%
+  summarise(Hijos = mean(Hijos, na.rm = T),
+            Ingresos = mean(Ingresos, na.rm = T),
+            Discriminacion = mean(Discriminacion, na.rm=T)*100,
+            TasaGen = sum(Sexo == "Mujer") / sum(Sexo == "Hombre")) 
+
+lattice_data <- left_join(nini_comunas, nini_comunas_hombres, by = "NOMBRE")
+lattice_data <- left_join(lattice_data , nini_comunas_mujeres, by = "NOMBRE")
+lattice_data <- left_join(lattice_data , nini_comunas_variables, by = "NOMBRE")
+datatable(lattice_data %>%   mutate_if(is.numeric, round, digits = 2))
+
+```
+
+# Visualización {.tabset}
+
+## shape
+
+```{r, warning=F, comment=F,message=FALSE,include=FALSE}
+shape_med <- st_read("medellin.geojson")
+```
+
+```{r}
+plot(shape_med[6])
+```
+
+```{r}
+df_lattice <- inner_join(shape_med, lattice_data, by = "NOMBRE")
+```
+
+## Mapa
+
+```{r, message=FALSE, warning=FALSE}
+tmap_mode("view")
+p1 <- tm_shape(df_lattice) +
+  tm_polygons(col = "NiniCortoPlazo", title = "Corto Plazo",
+              style ="cont",alpha = 0.8,id = "NOMBRE")+
+  tm_layout(legend.outside = TRUE)
+
+p2 <- tm_shape(df_lattice) +
+  tm_polygons(col = "NiniLargoPlazo", title = "Largo Plazo",
+              style = "cont",alpha = 0.8,id = "NOMBRE") +
+  tm_layout(legend.outside = TRUE)
+
+tmap_arrange(p1, p2)
+```
+
+## Centroides
+
+```{r}
+geometria <- st_make_valid(df_lattice$geometry) 
+
+centros<-st_centroid(geometria)
+ggplot() +
+  geom_sf(data = geometria, fill=4) +
+  geom_sf(data = centros, color = "black")+
+  theme_bw()
+
+
+#sf_use_s2(FALSE) #para que no use geometría esférica por lo que necesita el poly2nb
+matriz <-poly2nb(geometria) #objeto nb
+matriz #matriz de vecindad
+```
+
+## Grafo
+
+```{r}
+ColData1 <- df_lattice$NiniLargoPlazo
+coords1 = sf::st_coordinates(centros) # coordenadas de los centroides
+col_nb1 = matriz
+
+col_nb1_sf = spdep::nb2lines(col_nb1,
+                             coords=coords1,
+                             proj4string="WGS84",
+                             as_sf=T)
+```
+
+```{r}
+#grafico
+ggplot() +
+  geom_sf(data = geometria, fill="4")+
+  geom_sf(data = col_nb1_sf, col = 1)+
+  theme_bw()
+```
+
+# Moran Test
+
+```{=tex}
+\begin{align*}
+H_0 &: \text{No existe autocorrelación espacial} \\
+H_1 &: \text{Existe autocorrelación espacial}
+\end{align*}
+```
+```{r}
+pesos <- nb2listw(matriz, style = "W") 
+#W pesos estilo reina
+#B, Binary coding
+#C,  
+#“U”
+#“minmax” 
+#S” pesos
+
+moran.test(df_lattice$NiniLargoPlazo, pesos)
+moran.test(df_lattice$NiniCortoPlazo, pesos)
+
+mp <- moran.plot(df_lattice$NiniCortoPlazo, listw = pesos, labels = as.character(df_lattice$NOMBRE), pch = 19,plot = F)
+
+ggplot(mp, aes(x = x, y = wx)) + 
+  geom_point(shape = 1) + 
+  geom_smooth(formula = y ~ x, method = "lm") + 
+  geom_hline(yintercept = mean(mp$wx), lty = 2) + 
+  geom_vline(xintercept = mean(mp$x), lty = 2) + 
+  geom_point(data = mp[mp$is_inf,], aes(x = x, y = wx), shape = 9) +
+  geom_text(data = mp[mp$is_inf,], aes(x = x, y = wx, label = labels, vjust = 1.5)) +
+  theme_minimal() + 
+  xlab("Casos") + 
+  ylab("Spatially lagged")
+
+#summary(mp)
+```
+
+# Lisa {.tabset}
+
+```{=tex}
+\begin{align*}
+H_0 &: \text{No autocorrelación espacial} \\
+H_1 &: \text{autocorrelación espacial positiva o negativa}
+\end{align*}
+```
+## Gráfica
+
+```{r}
+lisa <- localmoran(df_lattice$NiniCortoPlazo, pesos)
+# Define los colores para las categorías
+colores <- c("Low-Low" = "blue", "High-Low" = "green", "Low-High" = "yellow", "High-High" = "red")
+
+# Crea un mapa de clusters espaciales con etiquetas
+plot(df_lattice[,11], col = ifelse(lisa[,1] > 0 & lisa[,5] < 0.05, colores[attr(lisa,"quadr")$mean], "gray"))
+legend("bottomright", legend = names(colores), fill = colores, cex = 0.8)
+
+
+
+
+```
+
+## Tabla
+
+```{r}
+df_lattice$lmI <- lisa[,"Ii"] # local Moran's I
+df_lattice$lmZ <- lisa[,"Z.Ii"] # z-scores
+# p-values corresponding to alternative greater
+df_lattice$lmp <- lisa[,"Pr(z != E(Ii))"]
+
+tabla <- df_lattice %>%
+  select(NOMBRE, lmp) %>%
+  st_drop_geometry() %>%
+  mutate(Valor.P = round(lmp, 4)) %>%
+  arrange(lmp) %>% 
+  select(-lmp)   # Extraer valores P
+
+tabla %>%
+  datatable(
+    options = list(
+      dom = 'tB<"clear">lfrtip',
+      searching = TRUE
+    )
+  )
+```
+
+# Modelo SAR {.tabset}
+
+$$Y = \rho W Y + X \beta + \varepsilon \\$$ donde:
+
+
+
+- $Y$ es un vector de variables dependientes.
+- $\rho$ es el parámetro de autocorrelación espacial.
+- $W$ es una matriz de pesos espaciales que captura la relación de vecindad entre las observaciones.
+- $X$ es una matriz de variables independientes.
+- $\beta$ es un vector de coeficientes para las variables independientes.
+- $\varepsilon$ es un término de error.
+
+
+## Ajuste intercepto
+
+```{r}
+modelo_sar <- spautolm(NiniCortoPlazo ~ 1, listw = pesos, data = df_lattice, family = "SAR")
+summary(modelo_sar)
+
+```
+
+## Ajuste variable predictora
+
+```{r}
+modelo_sar_cov <- spautolm(NiniCortoPlazo ~ Hijos+Discriminacion, listw = pesos, data = df_lattice %>% mutate(Ingresos = (Ingresos-mean(Ingresos))/sd(Ingresos)), family = "SAR")
+summary(modelo_sar_cov)
+```
+
+## Pronosticos
+
+```{r}
+df_lattice$residuos_sar <- residuals(modelo_sar, type = "sresid")
+df_lattice$residuos_sar_cov <- residuals(modelo_sar_cov, type = "sresid")
+
+# modelo_reg_sar <- lm(NiniCortoPlazo ~ residuos_sar, data =df_lattice) 
+# modelo_reg_sar_cov <- lm(NiniCortoPlazo ~ residuos_sar_cov, data =df_lattice) 
+# 
+# df_lattice$pronosticos <- predict(modelo_reg_sar, df_lattice)
+# df_lattice$pronosticos_cov <- predict(modelo_reg_sar_cov, df_lattice)
+
+df_lattice$pronosticos <- fitted.values(modelo_sar)
+df_lattice$pronosticos_cov <- fitted.values(modelo_sar_cov)
+
+df_lattice %>%
+  pivot_longer(cols = c(pronosticos, pronosticos_cov), 
+               names_to = "Modelo", 
+               values_to = "Pronostico") %>%
+  mutate(Modelo = recode(Modelo, 
+                         pronosticos = "Modelo Intercepto", 
+                         pronosticos_cov = "Modelo Covariables")) %>% 
+  ggplot() +
+  geom_sf(aes(fill = Pronostico)) + 
+  scale_fill_gradient(low = "royalblue1", high = "red2", name = "Pronósticos") + 
+  theme_bw() +
+  facet_wrap(~Modelo) +  # Crear paneles según el Modelo
+  ggtitle("Comparación de Modelos")
+
+```
+
+## Métricas
+
+```{r}
+mape <- function(valores_reales, valores_predichos) {
+  # Asegurarse de que los vectores sean del mismo tamaño
+  if(length(valores_reales) != length(valores_predichos)) {
+    stop("Los vectores 'valores_reales' y 'valores_predichos' deben tener la misma longitud")
+  }
+  
+  # Calcular el MAPE
+  error_porcentual <- abs((valores_reales - valores_predichos) / valores_reales)
+  mape_value <- mean(error_porcentual, na.rm = TRUE) * 100
+  
+  return(mape_value)
+}
+
+cat("MAPE modelo intercepto", mape(df_lattice$NiniCortoPlazo, df_lattice$pronosticos),"%\n")
+cat("MAPE modelo covariables", mape(df_lattice$NiniCortoPlazo, df_lattice$pronosticos_cov),"%\n")
+cat("MAPE modelo lineal", mape(df_lattice$NiniCortoPlazo, fitted.values(lm(NiniCortoPlazo~Hijos+Discriminacion, df_lattice))),"%\n")
+```
+
+# Modelo CAR {.tabset}
+
+$$Y = \lambda D Y + X \beta + \varepsilon \\$$ donde:
+
+-   $Y$ es un vector de variables dependientes.
+-   $\lambda$ es el parámetro de autocorrelación espacial.
+-   $D$ es una matriz de pesos espaciales que captura la relación de vecindad entre las observaciones.
+-   $\lambda D Y$ representa la influencia de las observaciones vecinas en cada observación individual.
+-   $X$ es una matriz de variables independientes.
+-   $\beta$ es un vector de coeficientes para las variables independientes.
+-   $\varepsilon$ es un término de error.
+
+## Ajuste intercepto
+
+```{r,warning=FALSE}
+modelo_car <- spautolm(NiniCortoPlazo ~ 1, listw = pesos, data = df_lattice, family = "CAR")
+summary(modelo_car)
+
+```
+
+## Ajuste variable predictora
+
+```{r,warning=FALSE}
+modelo_car_cov <- spautolm(NiniCortoPlazo ~ Hijos+Discriminacion, listw = pesos, data = df_lattice %>% mutate(Ingresos = (Ingresos-mean(Ingresos))/sd(Ingresos)), family = "CAR")
+summary(modelo_car_cov)
+```
+
+## Pronosticos
+
+```{r}
+df_lattice$residuos_car <- residuals(modelo_car, type = "sresid")
+df_lattice$residuos_car_cov <- residuals(modelo_car_cov, type = "sresid")
+
+# modelo_reg_car <- lm(NiniCortoPlazo ~ residuos_car, data =df_lattice) 
+# modelo_reg_car_cov <- lm(NiniCortoPlazo ~ residuos_car_cov, data =df_lattice) 
+# 
+# df_lattice$pronosticos_car <- predict(modelo_reg_car, df_lattice)
+# df_lattice$pronosticos_car_cov <- predict(modelo_reg_car_cov, df_lattice)
+
+df_lattice$pronosticos_car <- fitted.values(modelo_car)
+df_lattice$pronosticos_car_cov <- fitted.values(modelo_car_cov)
+
+df_lattice %>%
+  pivot_longer(cols = c(pronosticos_car, pronosticos_car_cov), 
+               names_to = "Modelo", 
+               values_to = "Pronostico") %>%
+  mutate(Modelo = recode(Modelo, 
+                         pronosticos = "Modelo CAR Intercepto", 
+                         pronosticos_cov = "Modelo CAR Covariables")) %>% 
+  ggplot() +
+  geom_sf(aes(fill = Pronostico)) + 
+  scale_fill_gradient(low = "royalblue1", high = "red2", name = "Pronósticos") + 
+  theme_bw() +
+  facet_wrap(~Modelo) +  # Crear paneles según el Modelo
+  ggtitle("Comparación de Modelos")
+
+  
+```
+
+## Métricas
+
+```{r}
+mape <- function(valores_reales, valores_predichos) {
+  # Asegurarse de que los vectores sean del mismo tamaño
+  if(length(valores_reales) != length(valores_predichos)) {
+    stop("Los vectores 'valores_reales' y 'valores_predichos' deben tener la misma longitud")
+  }
+  
+  # Calcular el MAPE
+  error_porcentual <- abs((valores_reales - valores_predichos) / valores_reales)
+  mape_value <- mean(error_porcentual, na.rm = TRUE) * 100
+  
+  return(mape_value)
+}
+
+ 
+
+
+cat("MAPE modelo intercepto", mape(df_lattice$NiniCortoPlazo, df_lattice$pronosticos_car),"%\n")
+cat("MAPE modelo covariables", mape(df_lattice$NiniCortoPlazo, df_lattice$pronosticos_car_cov),"%\n")
+cat("MAPE modelo lineal", mape(df_lattice$NiniCortoPlazo, fitted.values(lm(NiniCortoPlazo~Hijos+Discriminacion, df_lattice))),"%\n")
+```
